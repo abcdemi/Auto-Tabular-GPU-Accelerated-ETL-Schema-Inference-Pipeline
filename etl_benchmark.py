@@ -1,70 +1,88 @@
 import time
+import os
 import numpy as np
 import pandas as pd
-import cudf # The GPU Dataframe library
-import os
+import torch
 
-# Create a massive dummy dataset (10 Million rows, 20 columns)
-# This simulates a "merged" view of many OpenML datasets
-ROWS = 10_000_000
-COLS = 20
+# SETTINGS
+ROWS = 5_000_000  # 5 Million rows
+COLS = 20         # 20 Features
+BINS = 100        # We want to map floats to 0-99 (Tokenization)
 
-def create_dummy_csv():
-    print("Creating massive CSV on disk (this might take a moment)...")
-    df = pd.DataFrame(np.random.rand(ROWS, COLS), columns=[f"col_{i}" for i in range(COLS)])
-    # Add some categorical columns (simulated as ints)
-    df['cat_1'] = np.random.randint(0, 100, size=ROWS)
-    df['cat_2'] = np.random.randint(0, 50, size=ROWS)
-    df.to_csv("massive_data.csv", index=False)
-    print("CSV Created.")
+def create_dummy_data():
+    if not os.path.exists("massive_data.parquet"):
+        print(f"Generating {ROWS:,} rows of dummy data...")
+        # We generate in chunks to avoid blowing up RAM before we start
+        df = pd.DataFrame(np.random.randn(ROWS, COLS), columns=[f"col_{i}" for i in range(COLS)])
+        df.to_parquet("massive_data.parquet")
+        print("Data generated and saved.")
 
-def process_cpu():
-    print("\n--- CPU (Pandas) Pipeline ---")
+def cpu_etl_pandas():
+    print("\n--- CPU RUN (Pandas) ---")
     start = time.time()
     
     # 1. Load
-    df = pd.read_csv("massive_data.csv")
+    df = pd.read_parquet("massive_data.parquet")
     
-    # 2. Tokenization (Quantile Binning)
-    # This is standard preprocessing for Tabular Transformers
-    # We map every float to a bin (0-100)
+    # 2. Quantile Binning (The Bottleneck)
+    # We map every value to a bucket (0-100) based on distribution
     for col in df.columns:
-        if "cat" not in col:
-            # pd.qcut is heavy on CPU
-            df[col] = pd.qcut(df[col], q=100, labels=False, duplicates='drop')
-            
-    # 3. Save to Parquet
-    df.to_parquet("processed_cpu.parquet")
-    
+        # qcut sorts the data to find quantiles -> slow on CPU
+        df[col] = pd.qcut(df[col], q=BINS, labels=False, duplicates='drop')
+        
     end = time.time()
-    print(f"CPU Time: {end - start:.2f} seconds")
+    print(f"CPU Processing Time: {end - start:.2f} seconds")
+    return df
 
-def process_gpu():
-    print("\n--- GPU (RAPIDS cuDF) Pipeline ---")
+def gpu_etl_pytorch():
+    print("\n--- GPU RUN (PyTorch Tensor-ETL) ---")
     start = time.time()
     
-    # 1. Load (Directly to VRAM)
-    gdf = cudf.read_csv("massive_data.csv")
+    # 1. Load (Pandas is still needed to read the file, sadly)
+    # Optimization: In production, we'd use a C++ loader, but this is fine for now
+    df = pd.read_parquet("massive_data.parquet")
     
-    # 2. Tokenization (Quantile Binning)
-    # RAPIDS executes this in parallel across CUDA cores
-    for col in gdf.columns:
-        if "cat" not in col:
-            # cudf has optimized quantile binning
-            # We calculate quantiles and then digitize
-            quantiles = gdf[col].quantile([i/100 for i in range(101)])
-            # We skip the actual digitize call here for brevity, 
-            # but even calculating quantiles for 20 cols is the benchmark
-            
-    # 3. Save to Parquet (GPU accelerated compression)
-    gdf.to_parquet("processed_gpu.parquet")
+    # 2. Move to GPU (The overhead)
+    # Convert entire dataframe to a single float32 tensor
+    tensor_data = torch.tensor(df.values, dtype=torch.float32, device='cuda')
+    
+    # 3. Quantile Binning on GPU
+    # We need to process each column independently
+    
+    # Pre-calculate quantile thresholds (0%, 1%... 100%)
+    # This linspace is the % steps
+    steps = torch.linspace(0, 1, BINS + 1, device='cuda')
+    
+    # Output tensor to hold the "tokens" (integers)
+    tokenized_data = torch.zeros_like(tensor_data, dtype=torch.int32)
+    
+    # Loop through columns (The GPU is so fast, this loop is negligible)
+    for i in range(COLS):
+        col_data = tensor_data[:, i]
+        
+        # A. Find the boundaries (quantiles)
+        # standard deviation-based quantiles or exact quantiles
+        boundaries = torch.quantile(col_data, steps)
+        
+        # B. Bucketize (Map float to bin index)
+        # This is the "Search Sorted" algorithm, massively parallel on GPU
+        tokenized_data[:, i] = torch.bucketize(col_data, boundaries) - 1
+        
+        # Clamp to ensure 0-99 range (handle edges)
+        tokenized_data[:, i] = torch.clamp(tokenized_data[:, i], 0, BINS - 1)
+        
+    # 4. Sync to finish timing
+    torch.cuda.synchronize()
     
     end = time.time()
-    print(f"GPU Time: {end - start:.2f} seconds")
+    print(f"GPU Processing Time: {end - start:.2f} seconds")
+    return tokenized_data
 
 if __name__ == "__main__":
-    if not os.path.exists("massive_data.csv"):
-        create_dummy_csv()
-        
-    process_cpu()
-    process_gpu()
+    create_dummy_data()
+    
+    # Run CPU
+    cpu_etl_pandas()
+    
+    # Run GPU
+    gpu_etl_pytorch()
