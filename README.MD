@@ -86,7 +86,7 @@ python etl_benchmark_numba.py
 ```
 
 ## 🧠 Why Numba?
-While PyTorch or TensorFlow could solve this, they require the full CUDA Toolkit and 2GB+ of libraries. **Numba** interacts directly with the CUDA Driver API. This makes `Auto-Tabular` extremely portable—it can run on any machine with NVIDIA drivers, making it ideal for lightweight data ingestion containers in a Kubernetes cluster.
+While PyTorch or TensorFlow could solve this, they require the full CUDA Toolkit and 2GB+ of libraries. **Numba** interacts directly with the CUDA Driver API. This makes `Auto-Tabular` extremely portable as it can run on any machine with NVIDIA drivers, making it ideal for lightweight data ingestion containers in a Kubernetes cluster.
 
 ## 📝 License
 MIT License.
