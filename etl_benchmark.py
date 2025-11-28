@@ -80,10 +80,6 @@ def gpu_etl_pytorch():
 
 if __name__ == "__main__":
     create_dummy_data()
-
-    print(torch.cuda.is_available()) 
-
-    print(torch.cuda.get_device_name(0))
     
     # Run CPU
     cpu_etl_pandas()
