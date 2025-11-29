@@ -73,4 +73,4 @@ During development, I implemented two GPU approaches to solve this problem.
 ### Run Benchmark
 ```bash
 python etl_benchmark_pytorch.py
-``'
+```
