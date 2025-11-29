@@ -1,92 +1,79 @@
-Here is the polished `README.md` for your Data Engineering project.
+# Tensor-Native ETL: GPU-Accelerated Data Ingestion
 
-I have framed it to specifically highlight **High-Performance Computing (HPC)** skills, which is exactly what a startup building Foundation Models (like PriorLabs) looks for.
-
-***
-
-# Auto-Tabular: GPU-Accelerated ETL for Foundation Models
-
-**High-throughput Quantile Binning (Tokenization) pipeline using Custom Numba CUDA Kernels.**
+**High-Throughput Tabular Tokenization using PyTorch Primitives on RTX 3080.**
 
 ![Python](https://img.shields.io/badge/Python-3.10-blue)
-![Numba](https://img.shields.io/badge/Numba-CUDA-green)
+![PyTorch](https://img.shields.io/badge/PyTorch-CUDA%2012.4-orange)
 ![Hardware](https://img.shields.io/badge/GPU-RTX%203080-76B900)
-![Focus](https://img.shields.io/badge/Focus-ML%20Infrastructure-orange)
+![Speedup](https://img.shields.io/badge/Speedup-28x-brightgreen)
 
-## 🚀 The Problem
-Training **Tabular Foundation Models** (like TabPFN) requires ingesting terabytes of heterogeneous tabular data. A critical pre-processing step is **Tokenization**: converting continuous floating-point numbers into discrete integer bins (quantiles) so Transformers can process them.
-
-*   **The Bottleneck:** Standard CPU approaches (Pandas `qcut` / Scikit-Learn `KBinsDiscretizer`) rely on sorting and heavy branching. When processing millions of rows across thousands of datasets, the CPU becomes the ingestion bottleneck, starving the GPU during training.
-*   **The Scale:** 10 Million Rows $\times$ 20 Features = 200 Million operations.
+## 🚀 The Scenario
+In **Tabular Foundation Model** pipelines (like TabPFN or TabTransformer), raw continuous data must be "Tokenized" (Quantile Binned) before entering the Neural Network.
+*   **The Bottleneck:** Standard CPU ETL (Pandas `qcut`) is single-threaded and relies on slow sorting algorithms ($O(N \log N)$). For a dataset of **10 Million rows**, this creates an ~8-second bottleneck per batch.
+*   **The Scale:** 200 Million scalar operations (10M rows $\times$ 20 columns).
 
 ## ⚡ The Solution
-**Auto-Tabular** is a lightweight ETL engine that offloads the heavy quantization logic to the GPU.
-Instead of using heavy Deep Learning frameworks (like PyTorch) which add gigabytes of dependency overhead, this project implements a **raw CUDA kernel via Numba**. This allows for "Bare Metal" performance on any NVIDIA GPU with minimal setup.
+A **Tensor-Native ETL pipeline** that treats data ingestion as a massive matrix operation.
+Instead of using Pandas for logic or writing raw kernels from scratch, we load raw memory into VRAM and utilize **PyTorch's optimized GPU primitives**:
+1.  `torch.quantile`: Parallelized sorting and threshold calculation.
+2.  `torch.bucketize`: Parallelized **Binary Search** to map floats to token IDs.
 
-### Key Architecture
-1.  **Hybrid Execution:**
-    *   **CPU:** Handles IO and statistical inference (calculating percentiles/schema).
-    *   **GPU:** Handles the massive parallel transformation (mapping floats to tokens).
-2.  **Custom CUDA Kernel:**
-    *   Implements a parallelized **Linear Search** to map values to bins.
-    *   Minimizes memory bandwidth usage by processing data in contiguous float32 blocks.
-    *   Zero-dependency deployment (requires only NVIDIA Drivers, no CUDA Toolkit).
+## 📊 Benchmarks
 
-## 📊 Performance Benchmarks
+**Hardware:** NVIDIA GeForce RTX 3080 (10GB) vs. AMD Ryzen 5 CPU.
+**Task:** Quantile Binning (100 bins) on 10,000,000 rows.
 
-Tested on **NVIDIA GeForce RTX 3080** (10GB VRAM) processing a dataset of **10,000,000 Rows** (200 Million scalar values).
-
-| Metric | CPU (Pandas Optimized) | GPU (Numba Kernel) | Speedup |
+| Metric | CPU (Pandas) | GPU (PyTorch Native) | Speedup |
 | :--- | :--- | :--- | :--- |
-| **Compute Time** | 9.13 s | **0.48 s** | **18.9x** 🚀 |
-| **Throughput** | ~21M items/sec | **~416M items/sec** | **~20x** |
-| **Disk/Prep Overhead** | 0.51 s | 5.67 s* | N/A |
+| **Compute Latency** | 7.68 s | **0.27 s** | **28.0x** 🚀 |
+| **Data Transfer (PCIe)**| N/A | 0.52 s | Negligible |
+| **Total Pipeline Time** | 8.55 s | 1.36 s | **6.3x** |
 
-*> **Engineering Insight:** While the GPU compute is ~19x faster, the total wall time is currently bottlenecked by the CPU calculating percentile thresholds (Prep). A future optimization would move the sorting/percentile logic to the GPU using **Radix Sort** (via RAPIDS cuDF) to eliminate this final bottleneck.*
+*> **Engineering Insight:** The pure compute speedup is 28x. Even when accounting for the overhead of moving 1.6GB of data over the PCIe bus (Transfer time), the GPU approach is still 6x faster end-to-end.*
 
 ## 🛠️ Code Deep Dive
 
-The core of the project is a JIT-compiled CUDA kernel that maps continuous values to bucket indices in parallel:
+The pipeline leverages PyTorch as a general-purpose numerical accelerator, not just for Deep Learning. This allows for seamless "Zero-Copy" handoff to the model trainer.
 
 ```python
-@cuda.jit
-def bucketize_kernel(data, thresholds, output, rows, cols, bins):
-    # Global Thread ID (Row Index)
-    r = cuda.grid(1)
-    
-    if r < rows:
-        # Loop through columns for this specific row
-        for c in range(cols):
-            val = data[r, c]
-            bin_idx = bins - 1 
-            
-            # Fast Linear Search against column-specific thresholds
-            for b in range(bins):
-                if val < thresholds[c, b]:
-                    bin_idx = b
-                    break
-            
-            output[r, c] = bin_idx
+# The "Magic" Tokenization Step
+
+# 1. Pre-calculate quantiles (0%, 1%... 100%)
+# GPU-accelerated sorting/selection
+boundaries = torch.quantile(col_data, steps)
+
+# 2. Binary Search on GPU
+# Maps millions of floats to their bin index instantly
+# torch.bucketize uses Binary Search (O(log N)), unlike standard Linear Search
+tokens = torch.bucketize(col_data, boundaries) - 1
 ```
 
-## 💻 Installation & Usage
+## 🧠 Engineering Decision: PyTorch vs. Custom Kernels
+
+During development, I implemented two GPU approaches to solve this problem.
+
+1.  **Approach A: Custom Numba Kernel** (Linear Search)
+    *   *Result:* 0.48s Compute Time (~19x speedup).
+    *   *Pros:* No heavy dependencies, runs on bare CUDA driver.
+    *   *Cons:* Linear search complexity $O(N)$ per token.
+2.  **Approach B: PyTorch Native** (Binary Search)
+    *   *Result:* **0.27s Compute Time (~28x speedup).**
+    *   *Pros:* Utilizes NVIDIA's highly optimized C++ primitives; Binary search complexity $O(\log N)$.
+    *   *Cons:* Requires PyTorch installation.
+
+**Verdict:** I selected **PyTorch** for the final production pipeline as it provided a **1.7x performance gain** over the custom kernel and integrates natively with the downstream model training loop.
+
+## 💻 Usage
 
 ### Prerequisites
 *   Python 3.8+
-*   NVIDIA GPU
-*   `pip install numpy pandas numba pyarrow`
+*   PyTorch with CUDA support (tested on 2.5.1+cu124)
+*   `pip install pandas pyarrow`
 
-### Running the Benchmark
+### Run Benchmark
 ```bash
-# Clone the repository
-git clone https://github.com/yourusername/Auto-Tabular-GPU-ETL.git
-
-# Run the profiled benchmark
-python etl_benchmark_numba.py
+python etl_benchmark_pytorch.py
 ```
-
-## 🧠 Why Numba?
-While PyTorch or TensorFlow could solve this, they require the full CUDA Toolkit and 2GB+ of libraries. **Numba** interacts directly with the CUDA Driver API. This makes `Auto-Tabular` extremely portable as it can run on any machine with NVIDIA drivers, making it ideal for lightweight data ingestion containers in a Kubernetes cluster.
 
 ## 📝 License
 MIT License.
@@ -94,5 +81,6 @@ MIT License.
 ---
 
 ### Author
-**[Your Name]**
+**abcdemi**
+
 *Targeting ML Systems & Foundation Model Infrastructure.*
